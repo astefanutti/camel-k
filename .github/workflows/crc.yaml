@@ -1,0 +1,131 @@
+name: CRC
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  crc:
+    runs-on: macos-latest
+
+    steps:
+      - name: Info
+        run: |
+          df -h
+          sysctl hw.memsize
+          sw_vers
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup CRC
+        env:
+          PULL_SECRET: ${{ secrets.PULL_SECRET }}
+        run: |
+          #curl -LO https://storage.googleapis.com/minikube/releases/latest/docker-machine-driver-hyperkit && chmod +x docker-machine-driver-hyperkit
+          #sudo mv docker-machine-driver-hyperkit /usr/local/bin/
+          #sudo chown root:wheel /usr/local/bin/docker-machine-driver-hyperkit
+          #sudo chmod u+s /usr/local/bin/docker-machine-driver-hyperkit
+
+          brew install hyperkit
+
+          echo "mkdir -p ~/.crc/bin"
+          mkdir -p ~/.crc/bin
+          ln -s /usr/local/bin/hyperkit ~/.crc/bin/hyperkit
+          (cd ~/.crc/bin && sudo chown root:wheel hyperkit && sudo chmod u+s hyperkit && chmod +x hyperkit)
+
+          brew install docker
+
+          curl -O -sSL https://download.docker.com/mac/stable/31259/Docker.dmg
+          open -W Docker.dmg && cp -r /Volumes/Docker/Docker.app /Applications
+          sudo /Applications/Docker.app/Contents/MacOS/Docker --quit-after-install --unattended --insecure-registry=default-route-openshift-image-registry.apps-crc.testing
+
+          #echo "cat ~/.docker/daemon.json"
+          #echo "{\"debug\":true,\"experimental\":false,\"insecure-registries\":[\"default-route-openshift-image-registry.apps-crc.testing\"]}" > ~/.docker/daemon.json
+          #cat ~/.docker/daemon.json
+
+          nohup /Applications/Docker.app/Contents/MacOS/Docker --unattended --insecure-registry=default-route-openshift-image-registry.apps-crc.testing &
+
+          until docker stats --no-stream; do echo "Try again"; sleep 10; done
+
+          echo "cat ~/.docker/daemon.json"
+          cat ~/.docker/daemon.json || true
+
+          curl -L https://mirror.openshift.com/pub/openshift-v4/clients/crc/1.23.1/crc-macos-amd64.tar.xz -o crc-macos-amd64.tar.xz
+          tar xf crc-macos-amd64.tar.xz --strip-components=1
+          rm crc-macos-amd64.tar.xz
+
+          ./crc setup
+          ./crc config set memory 14336
+          #./crc config set cpus 4
+          ./crc config view
+
+          echo $PULL_SECRET > pull.secret
+          ./crc start -p pull.secret --memory 14336 --log-level debug
+
+          echo "eval $(./crc oc-env)"
+          eval $(./crc oc-env)
+          echo "env"
+          env
+          echo "cat ~/.kube/config"
+          cat ~/.kube/config || true
+          echo "cat /etc/hosts"
+          cat /etc/hosts
+
+          echo "curl 1"
+          curl -k -v https://oauth-openshift.apps-crc.testing/oauth/authorize || true
+          echo "curl 2"
+          curl -k -v https://api.crc.testing:6443/.well-known/oauth-authorization-server || true
+
+          echo "oc login"
+          oc login --insecure-skip-tls-verify=true -u kubeadmin -p $(./crc console --credentials | awk -F "kubeadmin" '{print $2}' | cut -c 5- | rev | cut -c31- | rev) https://api.crc.testing:6443 --v=9
+
+      - name: Build
+        run: |
+          #brew install docker docker-machine docker-machine-driver-hyperkit
+          #brew install docker docker-machine
+
+          echo "eval $(./crc oc-env)"
+          eval $(./crc oc-env)
+          echo "env"
+          env
+          echo "oc login"
+          oc login --insecure-skip-tls-verify=true -u kubeadmin -p $(./crc console --credentials | awk -F "kubeadmin" '{print $2}' | cut -c 5- | rev | cut -c31- | rev) https://api.crc.testing:6443 --v=9
+
+          echo "Build Kamel"
+          make build-kamel
+          echo "Adding maven artifacts to the image context"
+          make PACKAGE_ARTIFACTS_STRATEGY=download package-artifacts
+
+          echo "Build operator image"
+          mkdir -p ./build/_output/bin
+          cp ./kamel ./build/_output/bin/
+          export LOCAL_IMAGE=default-route-openshift-image-registry.apps-crc.testing/camel-k/camel-k:$(make get-version)
+          docker build -t "${LOCAL_IMAGE}" -f build/Dockerfile .
+          docker login -u kubeadmin -p $(oc whoami -t) default-route-openshift-image-registry.apps-crc.testing
+          docker push ${LOCAL_IMAGE}
+
+      - name: Run IT
+        # Disable registry tests as not compatible with KinD
+        #env:
+        #  TEST_DOCKER_HUB_USERNAME: ${{ secrets.TEST_DOCKER_HUB_USERNAME }}
+        #  TEST_DOCKER_HUB_PASSWORD: ${{ secrets.TEST_DOCKER_HUB_PASSWORD }}
+        #  TEST_GITHUB_PACKAGES_REPO: ${{ secrets.TEST_GITHUB_PACKAGES_REPO }}
+        #  TEST_GITHUB_PACKAGES_USERNAME: ${{ secrets.TEST_GITHUB_PACKAGES_USERNAME }}
+        #  TEST_GITHUB_PACKAGES_PASSWORD: ${{ secrets.TEST_GITHUB_PACKAGES_PASSWORD }}
+        run: |
+          echo "Installing camel k cluster resources"
+          kamel install --cluster-setup
+          # Configure install options
+          export REGISTRY=image-registry.openshift-image-registry.svc:5000
+          export KAMEL_INSTALL_MAVEN_REPOSITORIES=$(make get-staging-repo)
+          export KAMEL_INSTALL_REGISTRY=$REGISTRY
+          #export KAMEL_INSTALL_REGISTRY_INSECURE=true
+          export KAMEL_INSTALL_OPERATOR_IMAGE=$REGISTRY/camel-k/camel-k:$(make get-version)
+          # Configure test options
+          export CAMEL_K_TEST_IMAGE_NAME=$REGISTRY/camel-k/camel-k
+          export CAMEL_K_TEST_IMAGE_VERSION=$(make get-version)
+          # Then run integration tests
+          make test-integration
